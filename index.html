@@ -39,6 +39,8 @@ let compChart = null;
 let expenseCache = [];
 let unsubBills = null;
 let unsubExpenses = null;
+let unsubChargesReceived = null;
+let unsubChargesSent = null;
 
 const MONTHS = [
   'Janeiro','Fevereiro','Março','Abril','Maio','Junho',
@@ -171,6 +173,71 @@ function resolveGroup() {
 function safeText(value) {
   return String(value ?? '');
 }
+
+function chargeStatusFromExpense(item) {
+  return safeText(item?.cobrancaStatus || item?.status || '').toLowerCase();
+}
+
+function isChargeExpense(item) {
+  return safeText(item?.origem).toLowerCase() === 'cobranca' || Boolean(item?.cobrancaId);
+}
+
+function isCancelledChargeExpense(item) {
+  const status = chargeStatusFromExpense(item);
+  return isChargeExpense(item) && (
+    item?.cancelado === true ||
+    status === 'recusada' ||
+    status === 'cancelada'
+  );
+}
+
+function isPendingChargeExpense(item) {
+  const status = chargeStatusFromExpense(item);
+  return isChargeExpense(item) && !isCancelledChargeExpense(item) && (
+    item?.pendente === true ||
+    status === 'pendente' ||
+    status === 'aceita'
+  );
+}
+
+function isPaidChargeExpense(item) {
+  const status = chargeStatusFromExpense(item);
+  return isChargeExpense(item) && status === 'paga';
+}
+
+function activeExpensesOnly(items) {
+  return Object.values(items || {}).filter(item =>
+    item && Number.isFinite(Number(item.value)) && !isCancelledChargeExpense(item)
+  );
+}
+
+function splitExpenseTotals(items) {
+  const active = activeExpensesOnly(items);
+  const pendingCharges = active.filter(isPendingChargeExpense);
+  const paid = active.filter(item => !isPendingChargeExpense(item));
+
+  const paidTotal = paid.reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const pendingTotal = pendingCharges.reduce((sum, item) => sum + Number(item.value || 0), 0);
+
+  return {
+    active,
+    paid,
+    pendingCharges,
+    paidTotal,
+    pendingTotal,
+    committedTotal: paidTotal + pendingTotal
+  };
+}
+
+function chargeExpenseLabel(item) {
+  const status = chargeStatusFromExpense(item);
+  if (status === 'aceita') return 'cobrança aceita';
+  if (status === 'paga') return 'cobrança paga';
+  if (status === 'recusada') return 'cobrança recusada';
+  if (status === 'cancelada') return 'cobrança cancelada';
+  return 'cobrança pendente';
+}
+
 
 function showMsg(id, text, type) {
   const el = $(id);
@@ -348,8 +415,12 @@ function todayValue() {
 function stopListeners() {
   if (unsubBills) unsubBills();
   if (unsubExpenses) unsubExpenses();
+  if (unsubChargesReceived) unsubChargesReceived();
+  if (unsubChargesSent) unsubChargesSent();
   unsubBills = null;
   unsubExpenses = null;
+  unsubChargesReceived = null;
+  unsubChargesSent = null;
 }
 
 function startListeners() {
@@ -369,8 +440,25 @@ function startListeners() {
     async () => {
       await renderExpenses();
       await updateSummary();
+      await renderSavingsGoal();
     },
     () => showToast('Erro ao acompanhar gastos do mês.', 'err')
+  );
+
+  unsubChargesReceived = onValue(
+    ref(db, cobrancasRecebidasPath()),
+    async () => {
+      await renderCobrancas();
+    },
+    () => showToast('Erro ao acompanhar cobranças recebidas.', 'err')
+  );
+
+  unsubChargesSent = onValue(
+    ref(db, cobrancasEnviadasPath()),
+    async () => {
+      await renderCobrancas();
+    },
+    () => showToast('Erro ao acompanhar cobranças enviadas.', 'err')
   );
 }
 
@@ -873,7 +961,7 @@ window.exportarPDF = async function() {
       get(ref(db, budgetPath()))
     ]);
 
-    const items = Object.values(expenseSnap.val() || {})
+    const items = activeExpensesOnly(expenseSnap.val() || {})
       .sort((a, b) => safeText(a.date).localeCompare(safeText(b.date)));
 
     const budget = Number(budgetSnap.val() || 0);
@@ -940,14 +1028,16 @@ async function renderExpenses() {
   const data = snap.val() || {};
 
   expenseCache = Object.entries(data)
-    .filter(([, item]) => item && Number.isFinite(Number(item.value)))
+    .filter(([, item]) => item && Number.isFinite(Number(item.value)) && !isCancelledChargeExpense(item))
     .sort((a, b) => safeText(b[1].date).localeCompare(safeText(a[1].date)));
 
+  const pendingCount = expenseCache.filter(([, item]) => isPendingChargeExpense(item)).length;
+
   $('exp-count').textContent =
-    `${expenseCache.length} registro${expenseCache.length === 1 ? '' : 's'}`;
+    `${expenseCache.length} registro${expenseCache.length === 1 ? '' : 's'}${pendingCount ? ` · ${pendingCount} pendente${pendingCount === 1 ? '' : 's'}` : ''}`;
 
   renderExpenseList();
-  await renderChart(Object.values(data));
+  await renderChart(activeExpensesOnly(data));
 }
 
 function renderExpenseList() {
@@ -1006,7 +1096,10 @@ function renderExpenseList() {
 
       const info = make('div', 'expense-info');
       const desc = make('div', 'expense-desc', safeText(item.desc || 'Gasto'));
-      const meta = make('div', 'expense-meta', `${cat.icon} ${cat.name}`);
+      const metaText = isChargeExpense(item)
+        ? `${cat.icon} ${cat.name} · ${chargeExpenseLabel(item)}`
+        : `${cat.icon} ${cat.name}`;
+      const meta = make('div', 'expense-meta', metaText);
 
       if (item.parcelaTotal) {
         desc.appendChild(make('span', 'tag tag-purple', `${item.parcelaNum}/${item.parcelaTotal}x`));
@@ -1016,21 +1109,40 @@ function renderExpenseList() {
         desc.appendChild(make('span', 'tag tag-blue', 'fixo'));
       }
 
+      if (isPendingChargeExpense(item)) {
+        desc.appendChild(make('span', 'tag tag-yellow', chargeStatusFromExpense(item) === 'aceita' ? 'aceita pendente' : 'pendente'));
+        row.classList.add('expense-item-pending');
+      }
+
+      if (isPaidChargeExpense(item)) {
+        desc.appendChild(make('span', 'tag tag-green', 'paga'));
+        row.classList.add('expense-item-paid-charge');
+      }
+
       info.append(desc, meta);
 
-      const amount = make('strong', 'expense-amount', fmt(item.value));
-
-      const actions = make('div', 'expense-actions');
-      actions.append(
-        makeButton('⧉', 'btn-icon', 'Duplicar gasto', () => duplicateExpense(item)),
-        makeButton('✎', 'btn-icon btn-icon-edit', 'Editar gasto', () => abrirEditar(id, item)),
-        makeButton('⌫', 'btn-icon btn-icon-danger', 'Excluir gasto', () => deleteExpense(id, item))
+      const amount = make(
+        'strong',
+        'expense-amount' + (isPendingChargeExpense(item) ? ' expense-amount-pending' : ''),
+        fmt(item.value)
       );
 
-      if (item.parcelaId) {
+      const actions = make('div', 'expense-actions');
+
+      if (isChargeExpense(item)) {
+        actions.appendChild(make('span', 'expense-meta', 'via WhatsApp'));
+      } else {
         actions.append(
-          makeButton('⛓', 'btn-icon btn-icon-danger', 'Excluir parcelamento', () => deleteInstallmentGroup(item.parcelaId))
+          makeButton('⧉', 'btn-icon', 'Duplicar gasto', () => duplicateExpense(item)),
+          makeButton('✎', 'btn-icon btn-icon-edit', 'Editar gasto', () => abrirEditar(id, item)),
+          makeButton('⌫', 'btn-icon btn-icon-danger', 'Excluir gasto', () => deleteExpense(id, item))
         );
+
+        if (item.parcelaId) {
+          actions.append(
+            makeButton('⛓', 'btn-icon btn-icon-danger', 'Excluir parcelamento', () => deleteInstallmentGroup(item.parcelaId))
+          );
+        }
       }
 
       row.append(dot, info, amount, actions);
@@ -1173,7 +1285,7 @@ async function renderCompChart() {
       ref(db, `grupos/${currentGroup}/usuarios/${currentUser}/gastos/${year}_${month}`)
     );
 
-    const total = Object.values(snap.val() || {})
+    const total = activeExpensesOnly(snap.val() || {})
       .reduce((sum, item) => sum + Number(item.value || 0), 0);
 
     values.push(total);
@@ -1513,8 +1625,8 @@ async function renderSavingsGoal() {
   const target = hasSmartGoal ? Number(goal.valorMeta || 0) : legacyMeta;
   const profile = profileSnap.val() || {};
   const income = Number(profile.rendaMensal || 0);
-  const expenses = Object.values(expenseSnap.val() || {});
-  const spent = expenses.reduce((sum, item) => sum + Number(item.value || 0), 0);
+  const expenseTotals = splitExpenseTotals(expenseSnap.val() || {});
+  const spent = expenseTotals.committedTotal;
   const projectedSavings = income ? income - spent : 0;
   const progress = target && income
     ? Math.max(0, Math.min(100, Math.round((projectedSavings / target) * 100)))
@@ -1554,11 +1666,16 @@ async function updateSummary() {
     get(ref(db, metaPath()))
   ]);
 
-  const expenses = Object.values(expenseSnap.val() || {});
-  const bills = Object.values(billSnap.val() || {});
+  const expenseTotals = splitExpenseTotals(expenseSnap.val() || {});
+  const expenses = expenseTotals.active;
+  const paidExpenses = expenseTotals.paid;
+  const pendingCharges = expenseTotals.pendingCharges;
   const budget = Number(budgetSnap.val() || 0);
-  const total = expenses.reduce((sum, item) => sum + Number(item.value || 0), 0);
-  const remaining = budget - total;
+  const totalPaid = expenseTotals.paidTotal;
+  const pendingChargesTotal = expenseTotals.pendingTotal;
+  const committedTotal = expenseTotals.committedTotal;
+  const remaining = budget - committedTotal;
+  const bills = Object.values(billSnap.val() || {});
   const billsTotal = bills.reduce((sum, bill) => sum + Number(bill.value || 0), 0);
   const pending = bills.reduce((sum, bill) =>
     sum + Object.values(bill.participantes || {}).filter(person => !person.pago).length, 0
@@ -1566,15 +1683,19 @@ async function updateSummary() {
   const meta = Number(metaSnap.val() || 0);
 
   $('summary-budget').textContent = fmt(budget);
-  $('summary-spent').textContent = fmt(total);
+  $('summary-spent').textContent = fmt(totalPaid);
   $('summary-remaining').textContent = fmt(Math.abs(remaining));
   $('summary-bills').textContent = fmt(billsTotal);
 
+  if ($('summary-pending-charges')) {
+    $('summary-pending-charges').textContent = fmt(pendingChargesTotal);
+  }
+
   $('summary-spent-pct').textContent =
-    budget ? `${Math.round(total / budget * 100)}% do orçamento` : 'Orçamento não definido';
+    budget ? `${Math.round(committedTotal / budget * 100)}% do orçamento comprometido` : 'Orçamento não definido';
 
   $('summary-remaining-sub').textContent =
-    remaining >= 0 ? 'Ainda disponível' : 'Orçamento excedido';
+    remaining >= 0 ? 'Disponível após pendências' : 'Orçamento comprometido excedido';
 
   $('summary-remaining').className =
     'card-value ' + (remaining >= 0 ? 'text-warning' : 'text-danger');
@@ -1585,25 +1706,26 @@ async function updateSummary() {
   $('budget-bar-wrap').style.display = budget > 0 ? 'block' : 'none';
 
   if (budget > 0) {
-    const pct = Math.min(100, Math.round(total / budget * 100));
+    const pct = Math.min(100, Math.round(committedTotal / budget * 100));
     $('budget-bar').style.width = `${pct}%`;
     $('budget-bar').style.background =
       pct >= 100 ? 'var(--danger)' : pct >= 80 ? 'var(--warning)' : 'var(--accent)';
   }
 
-  $('summary-count').textContent = String(expenses.length);
+  $('summary-count').textContent =
+    `${expenses.length}${pendingCharges.length ? ` · ${pendingCharges.length} pendente${pendingCharges.length === 1 ? '' : 's'}` : ''}`;
 
   const byCategory = {};
-  expenses.forEach(item => {
+  paidExpenses.forEach(item => {
     const cat = CAT_BY_NAME[item.cat] ? item.cat : 'Outros';
     byCategory[cat] = (byCategory[cat] || 0) + Number(item.value || 0);
   });
 
   const topCategory = Object.entries(byCategory).sort((a, b) => b[1] - a[1])[0];
-  $('summary-top-cat').textContent = topCategory ? topCategory[0] : 'Sem gastos';
+  $('summary-top-cat').textContent = topCategory ? topCategory[0] : 'Sem gastos pagos';
 
   const usedDays = new Set(expenses.map(item => item.date).filter(Boolean)).size || 1;
-  $('summary-average').textContent = fmt(total / usedDays);
+  $('summary-average').textContent = fmt(committedTotal / usedDays);
 
   if (meta > 0) {
     const saved = Math.max(0, remaining);
@@ -1614,8 +1736,8 @@ async function updateSummary() {
     $('meta-progress-bar').style.width = `${pct}%`;
     $('meta-status').textContent =
       saved >= meta
-        ? `Meta atingida. Você economizou ${fmt(saved)}.`
-        : `${fmt(saved)} de ${fmt(meta)}. Faltam ${fmt(meta - saved)}.`;
+        ? `Meta atingida. Você economizou ${fmt(saved)} após considerar pendências.`
+        : `${fmt(saved)} de ${fmt(meta)}. Faltam ${fmt(meta - saved)} considerando pendências.`;
   } else {
     $('meta-section').style.display = 'none';
   }
@@ -1864,7 +1986,7 @@ header {
 
 .summary-grid {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 12px;
   margin-bottom: 12px;
 }
@@ -2234,6 +2356,29 @@ select:focus {
 .tag-blue {
   color: var(--info);
   background: rgba(79,141,247,.14);
+}
+
+.tag-yellow {
+  color: var(--warning);
+  background: rgba(242,177,61,.14);
+}
+
+.tag-green {
+  color: var(--accent);
+  background: rgba(18,185,129,.14);
+}
+
+.expense-item-pending {
+  border-color: rgba(242,177,61,.22);
+  background: rgba(242,177,61,.07);
+}
+
+.expense-item-paid-charge {
+  border-color: rgba(18,185,129,.18);
+}
+
+.expense-amount-pending {
+  color: var(--warning);
 }
 
 .parcela-preview {
@@ -2761,8 +2906,14 @@ select:focus {
       </div>
 
       <div class="summary-card">
-        <div class="card-label">Total gasto</div>
+        <div class="card-label">Gastos pagos</div>
         <div class="card-value text-danger" id="summary-spent">R$ 0,00</div>
+        <div class="card-sub">Sem contar cobranças pendentes</div>
+      </div>
+
+      <div class="summary-card">
+        <div class="card-label">Cobranças pendentes</div>
+        <div class="card-value text-warning" id="summary-pending-charges">R$ 0,00</div>
         <div class="card-sub" id="summary-spent-pct">Orçamento não definido</div>
       </div>
 
