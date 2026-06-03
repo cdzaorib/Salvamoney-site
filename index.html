@@ -100,7 +100,9 @@ function expPath() {
 }
 
 function billPath() {
-  return `grupos/${currentGroup}/contas/${monthKey()}`;
+  // Contas a dividir agora ficam dentro do usuário/tag.
+  // Isso evita erro de permissão no dashboard e mantém o site alinhado ao login por tag.
+  return `grupos/${currentGroup}/usuarios/${currentUser}/contas/${monthKey()}`;
 }
 
 function budgetPath() {
@@ -1327,7 +1329,9 @@ async function renderBills() {
   const snap = await get(ref(db, billPath()));
   const data = snap.val() || {};
   const container = $('bills-list');
-  const entries = Object.entries(data);
+  const entries = Object.entries(data)
+    .filter(([, bill]) => bill && Number.isFinite(Number(bill.value)))
+    .sort((a, b) => safeText(b[1].createdAt).localeCompare(safeText(a[1].createdAt)));
 
   if (!entries.length) {
     emptyState(container, '🤝', 'Nenhuma conta cadastrada');
@@ -1357,6 +1361,7 @@ async function renderBills() {
     const participants = Object.entries(bill.participantes || {});
     const paidCount = participants.filter(([, person]) => person.pago).length;
     const progress = participants.length ? Math.round(paidCount / participants.length * 100) : 0;
+    const shareValue = Number(bill.parcela || 0) || (participants.length ? Number(bill.value || 0) / participants.length : 0);
 
     const progressWrap = make('div', 'bill-progress');
     const progressBar = make('div', 'bill-progress-bar');
@@ -1376,7 +1381,7 @@ async function renderBills() {
 
       const check = make('span', 'participant-check' + (person.pago ? ' checked' : ''), person.pago ? '✓' : '');
       const name = make('span', 'participant-name', safeText(person.nome));
-      const value = make('span', 'participant-val', fmt(bill.parcela));
+      const value = make('span', 'participant-val', fmt(shareValue));
       const status = make(
         'span',
         'participant-status ' + (person.pago ? 'paid' : 'pending'),
